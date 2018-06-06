@@ -11,12 +11,15 @@ import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewDatabase;
 
-import acr.browser.lightning.database.HistoryDatabase;
+import acr.browser.lightning.database.history.HistoryRepository;
+import io.reactivex.Scheduler;
 
 /**
  * Copyright 8/4/2015 Anthony Restaino
  */
-public class WebUtils {
+public final class WebUtils {
+
+    private WebUtils() {}
 
     public static void clearCookies(@NonNull Context context) {
         CookieManager c = CookieManager.getInstance();
@@ -34,8 +37,12 @@ public class WebUtils {
         WebStorage.getInstance().deleteAllData();
     }
 
-    public static void clearHistory(@NonNull Context context, @NonNull HistoryDatabase historyDatabase) {
-        historyDatabase.deleteHistory();
+    public static void clearHistory(@NonNull Context context,
+                                    @NonNull HistoryRepository historyRepository,
+                                    @NonNull Scheduler databaseScheduler) {
+        historyRepository.deleteHistory()
+                .subscribeOn(databaseScheduler)
+                .subscribe();
         WebViewDatabase m = WebViewDatabase.getInstance(context);
         m.clearFormData();
         m.clearHttpAuthUsernamePassword();

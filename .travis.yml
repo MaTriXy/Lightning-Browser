@@ -5,21 +5,20 @@ jdk:
 android:
   components:
     - tools
-    - build-tools-24.0.3
-    - build-tools-23.0.3
-    - build-tools-22.0.1
-    - android-24
-    - android-23
-    - android-22
-    - extra-android-support
-    - extra-android-m2repository
+    - build-tools-27.0.3
+    - android-27
   licenses:
     - 'android-sdk-license-.+'
     - '.*intel.+'
 before_install:
+  - yes | sdkmanager "platforms;android-27"
   - chmod +x gradlew
   - git submodule update --init --recursive
 install:
   - ./gradlew
 script:
-  - ./gradlew assembleDebug --stacktrace
+  - ./gradlew :app:assembleDebug --stacktrace
+  - ./gradlew :app:test --stacktrace
+  - ./gradlew jacocoTestReport
+after_success:
+  - bash <(curl -s https://codecov.io/bash)
