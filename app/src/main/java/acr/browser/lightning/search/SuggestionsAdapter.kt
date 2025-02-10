@@ -1,115 +1,99 @@
 package acr.browser.lightning.search
 
-import acr.browser.lightning.BrowserApp
 import acr.browser.lightning.R
-import acr.browser.lightning.database.HistoryItem
+import acr.browser.lightning.database.Bookmark
+import acr.browser.lightning.database.HistoryEntry
+import acr.browser.lightning.database.SearchSuggestion
+import acr.browser.lightning.database.WebPage
 import acr.browser.lightning.database.bookmark.BookmarkRepository
 import acr.browser.lightning.database.history.HistoryRepository
+import acr.browser.lightning.di.DatabaseScheduler
+import acr.browser.lightning.di.MainScheduler
+import acr.browser.lightning.di.NetworkScheduler
+import acr.browser.lightning.di.injector
+import acr.browser.lightning.extensions.drawable
 import acr.browser.lightning.preference.UserPreferences
-import acr.browser.lightning.search.suggestions.*
-import acr.browser.lightning.utils.ThemeUtils
-import android.app.Application
+import acr.browser.lightning.rx.join
+import acr.browser.lightning.search.suggestions.NoOpSuggestionsRepository
+import acr.browser.lightning.search.suggestions.SuggestionsRepository
 import android.content.Context
-import android.graphics.Color
-import android.graphics.drawable.Drawable
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.*
-import io.reactivex.Completable
-import io.reactivex.Scheduler
-import io.reactivex.Single
-import io.reactivex.android.schedulers.AndroidSchedulers
-import io.reactivex.disposables.Disposable
-import io.reactivex.schedulers.Schedulers
+import android.widget.BaseAdapter
+import android.widget.Filter
+import android.widget.Filterable
+import io.reactivex.*
+import io.reactivex.Observable
+import io.reactivex.subjects.PublishSubject
 import java.util.*
-import java.util.concurrent.Executors
 import javax.inject.Inject
-import javax.inject.Named
 
 class SuggestionsAdapter(
-        private val context: Context,
-        dark: Boolean,
-        incognito: Boolean
+    context: Context,
+    private val isIncognito: Boolean
 ) : BaseAdapter(), Filterable {
 
-    private val filterScheduler = Schedulers.from(Executors.newSingleThreadExecutor())
-    private val maxSuggestions = 5
+    private var filteredList: List<WebPage> = emptyList()
 
-    private val filteredList = ArrayList<HistoryItem>(5)
-
-    private val history = ArrayList<HistoryItem>(5)
-    private val bookmarks = ArrayList<HistoryItem>(5)
-    private val suggestions = ArrayList<HistoryItem>(5)
-
-    private val searchDrawable: Drawable
-    private val historyDrawable: Drawable
-    private val bookmarkDrawable: Drawable
-
-    private val filterComparator = SuggestionsComparator()
-
-    @Inject internal lateinit var bookmarkManager: BookmarkRepository
+    @Inject internal lateinit var bookmarkRepository: BookmarkRepository
     @Inject internal lateinit var userPreferences: UserPreferences
-    @Inject internal lateinit var historyModel: HistoryRepository
-    @Inject internal lateinit var application: Application
-    @Inject @field:Named("database") internal lateinit var databaseScheduler: Scheduler
-    @Inject @field:Named("network") internal lateinit var networkScheduler: Scheduler
+    @Inject internal lateinit var historyRepository: HistoryRepository
+    @Inject @field:DatabaseScheduler internal lateinit var databaseScheduler: Scheduler
+    @Inject @field:NetworkScheduler internal lateinit var networkScheduler: Scheduler
+    @Inject @field:MainScheduler internal lateinit var mainScheduler: Scheduler
+    @Inject internal lateinit var searchEngineProvider: SearchEngineProvider
 
-    private val allBookmarks = ArrayList<HistoryItem>(5)
+    private var allBookmarks: List<Bookmark.Entry> = emptyList()
+    private val searchFilter = SearchFilter(this)
 
-    private val darkTheme: Boolean
-    private var isIncognito = true
+    private val searchIcon = context.drawable(R.drawable.ic_search)
+    private val webPageIcon = context.drawable(R.drawable.ic_history)
+    private val bookmarkIcon = context.drawable(R.drawable.ic_bookmark)
+    private var suggestionsRepository: SuggestionsRepository
 
-    private val searchFilter: SearchFilter
+    /**
+     * The listener that is fired when the insert button on a [SearchSuggestion] is clicked.
+     */
+    var onSuggestionInsertClick: ((WebPage) -> Unit)? = null
+
+    private val onClick = View.OnClickListener {
+        onSuggestionInsertClick?.invoke(it.tag as WebPage)
+    }
+
+    private val layoutInflater = LayoutInflater.from(context)
 
     init {
-        BrowserApp.appComponent.inject(this)
-        darkTheme = dark || incognito
-        isIncognito = incognito
+        context.injector.inject(this)
 
-        val suggestionsRepository = if (isIncognito) {
+        suggestionsRepository = if (isIncognito) {
             NoOpSuggestionsRepository()
         } else {
-            suggestionsRepositoryForPreference()
+            searchEngineProvider.provideSearchSuggestions()
         }
-
-        searchFilter = SearchFilter(suggestionsRepository,
-                this,
-                historyModel,
-                databaseScheduler,
-                networkScheduler)
 
         refreshBookmarks()
 
-        searchDrawable = ThemeUtils.getThemedDrawable(context, R.drawable.ic_search, darkTheme)
-        bookmarkDrawable = ThemeUtils.getThemedDrawable(context, R.drawable.ic_bookmark, darkTheme)
-        historyDrawable = ThemeUtils.getThemedDrawable(context, R.drawable.ic_history, darkTheme)
+        searchFilter.input().results()
+            .subscribeOn(databaseScheduler)
+            .observeOn(mainScheduler)
+            .subscribe(::publishResults)
     }
 
-    private fun suggestionsRepositoryForPreference(): SuggestionsRepository =
-            when (userPreferences.searchSuggestionChoice) {
-                0 -> NoOpSuggestionsRepository()
-                1 -> GoogleSuggestionsModel(application)
-                2 -> DuckSuggestionsModel(application)
-                3 -> BaiduSuggestionsModel(application)
-                else -> GoogleSuggestionsModel(application)
-            }
-
     fun refreshPreferences() {
-        searchFilter.suggestionsRepository = if (isIncognito) {
+        suggestionsRepository = if (isIncognito) {
             NoOpSuggestionsRepository()
         } else {
-            suggestionsRepositoryForPreference()
+            searchEngineProvider.provideSearchSuggestions()
         }
     }
 
     fun refreshBookmarks() {
-        bookmarkManager.getAllBookmarks()
-                .subscribeOn(databaseScheduler)
-                .subscribe { list ->
-                    allBookmarks.clear()
-                    allBookmarks.addAll(list)
-                }
+        bookmarkRepository.getAllBookmarksSorted()
+            .subscribeOn(databaseScheduler)
+            .subscribe { list ->
+                allBookmarks = list
+            }
     }
 
     override fun getCount(): Int = filteredList.size
@@ -123,202 +107,138 @@ class SuggestionsAdapter(
 
     override fun getItemId(position: Int): Long = 0
 
-    private class SuggestionHolder internal constructor(view: View) {
-
-        internal val mImage = view.findViewById<ImageView>(R.id.suggestionIcon)
-        internal val mTitle = view.findViewById<TextView>(R.id.title)
-        internal val mUrl = view.findViewById<TextView>(R.id.url)
-
-    }
-
     override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-
-        val holder: SuggestionHolder
+        val holder: SuggestionViewHolder
         val finalView: View
 
         if (convertView == null) {
-            val inflater = LayoutInflater.from(context)
-            finalView = inflater.inflate(R.layout.two_line_autocomplete, parent, false)
+            finalView = layoutInflater.inflate(R.layout.two_line_autocomplete, parent, false)
 
-            holder = SuggestionHolder(finalView)
+            holder = SuggestionViewHolder(finalView)
             finalView.tag = holder
         } else {
             finalView = convertView
-            holder = convertView.tag as SuggestionHolder
+            holder = convertView.tag as SuggestionViewHolder
         }
-        val web: HistoryItem = filteredList[position]
+        val webPage: WebPage = filteredList[position]
 
-        holder.mTitle.text = web.title
-        holder.mUrl.text = web.url
+        holder.titleView.text = webPage.title
+        holder.urlView.text = webPage.url
 
-        if (darkTheme) {
-            holder.mTitle.setTextColor(Color.WHITE)
-        }
-
-        val image = when (web.imageId) {
-            R.drawable.ic_bookmark -> bookmarkDrawable
-            R.drawable.ic_search -> searchDrawable
-            R.drawable.ic_history -> historyDrawable
-            else -> searchDrawable
+        val image = when (webPage) {
+            is Bookmark -> bookmarkIcon
+            is SearchSuggestion -> searchIcon
+            is HistoryEntry -> webPageIcon
         }
 
-        holder.mImage.setImageDrawable(image)
+        holder.imageView.setImageDrawable(image)
+
+        holder.insertSuggestion.tag = webPage
+        holder.insertSuggestion.setOnClickListener(onClick)
 
         return finalView
     }
 
     override fun getFilter(): Filter = searchFilter
 
-    private fun publishResults(list: List<HistoryItem>) {
+    private fun publishResults(list: List<WebPage>?) {
+        if (list == null) {
+            notifyDataSetChanged()
+            return
+        }
         if (list != filteredList) {
-            filteredList.clear()
-            filteredList.addAll(list)
+            filteredList = list
             notifyDataSetChanged()
         }
     }
 
-    private fun clearSuggestions() {
-        Completable
-                .fromAction {
-                    bookmarks.clear()
-                    history.clear()
-                    suggestions.clear()
+    private fun getBookmarksForQuery(query: String): Single<List<Bookmark.Entry>> =
+        Single.fromCallable {
+            (allBookmarks.filter {
+                it.title.toLowerCase(Locale.getDefault()).startsWith(query)
+            } + allBookmarks.filter {
+                it.url.contains(query)
+            }).distinct().take(MAX_SUGGESTIONS)
+        }
+
+    private fun Observable<CharSequence>.results(): Flowable<List<WebPage>> = this
+        .toFlowable(BackpressureStrategy.LATEST)
+        .map { it.toString().toLowerCase(Locale.getDefault()).trim() }
+        .filter(String::isNotEmpty)
+        .share()
+        .compose { upstream ->
+            val searchEntries = upstream
+                .flatMapSingle(suggestionsRepository::resultsForSearch)
+                .subscribeOn(networkScheduler)
+                .startWith(emptyList<List<SearchSuggestion>>())
+                .share()
+
+            val bookmarksEntries = upstream
+                .flatMapSingle(::getBookmarksForQuery)
+                .subscribeOn(databaseScheduler)
+                .startWith(emptyList<List<Bookmark.Entry>>())
+                .share()
+
+            val historyEntries = upstream
+                .flatMapSingle(historyRepository::findHistoryEntriesContaining)
+                .subscribeOn(databaseScheduler)
+                .startWith(emptyList<HistoryEntry>())
+                .share()
+
+            // Entries priority and ideal count:
+            // Bookmarks - 2
+            // History - 2
+            // Search - 1
+
+            bookmarksEntries
+                .join(
+                    historyEntries,
+                    { bookmarksEntries },
+                    { historyEntries }
+                ) { t1, t2 -> Pair(t1, t2) }
+                .compose { bookmarksAndHistory ->
+                    bookmarksAndHistory.join(
+                        searchEntries,
+                        { bookmarksAndHistory },
+                        { searchEntries }
+                    ) { (bookmarks, history), t2 ->
+                        Triple(bookmarks, history, t2)
+                    }
                 }
-                .subscribeOn(filterScheduler)
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe()
+        }
+        .map { (bookmarks, history, searches) ->
+            val bookmarkCount = MAX_SUGGESTIONS - 2.coerceAtMost(history.size) - 1.coerceAtMost(searches.size)
+            val historyCount = MAX_SUGGESTIONS - bookmarkCount.coerceAtMost(bookmarks.size) - 1.coerceAtMost(searches.size)
+            val searchCount = MAX_SUGGESTIONS - bookmarkCount.coerceAtMost(bookmarks.size) - historyCount.coerceAtMost(history.size)
+
+            bookmarks.take(bookmarkCount) + history.take(historyCount) + searches.take(searchCount)
+        }
+
+    companion object {
+        private const val MAX_SUGGESTIONS = 5
     }
 
-    private fun combineResults(bookmarkList: List<HistoryItem>?,
-                               historyList: List<HistoryItem>?,
-                               suggestionList: List<HistoryItem>?) {
-        Single
-                .create<List<HistoryItem>> {
-                    val list = ArrayList<HistoryItem>(5)
-                    if (bookmarkList != null) {
-                        bookmarks.clear()
-                        bookmarks.addAll(bookmarkList)
-                    }
-                    if (historyList != null) {
-                        history.clear()
-                        history.addAll(historyList)
-                    }
-                    if (suggestionList != null) {
-                        suggestions.clear()
-                        suggestions.addAll(suggestionList)
-                    }
-                    val bookmark = bookmarks.iterator()
-                    val history = history.iterator()
-                    val suggestion = suggestions.listIterator()
-                    while (list.size < maxSuggestions) {
-                        if (!bookmark.hasNext() && !suggestion.hasNext() && !history.hasNext()) {
-                            break
-                        }
-                        if (bookmark.hasNext()) {
-                            list.add(bookmark.next())
-                        }
-                        if (suggestion.hasNext() && list.size < maxSuggestions) {
-                            list.add(suggestion.next())
-                        }
-                        if (history.hasNext() && list.size < maxSuggestions) {
-                            list.add(history.next())
-                        }
-                    }
-
-                    Collections.sort(list, filterComparator)
-                    it.onSuccess(list)
-                }
-                .subscribeOn(filterScheduler)
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(this::publishResults)
-    }
-
-    private fun getBookmarksForQuery(query: String): Single<List<HistoryItem>> =
-            Single.create {
-                val bookmarks = ArrayList<HistoryItem>(5)
-                var counter = 0
-                for (n in allBookmarks.indices) {
-                    if (counter >= 5) {
-                        break
-                    }
-                    if (allBookmarks[n].title.toLowerCase(Locale.getDefault())
-                                    .startsWith(query)) {
-                        bookmarks.add(allBookmarks[n])
-                        counter++
-                    } else if (allBookmarks[n].url.contains(query)) {
-                        bookmarks.add(allBookmarks[n])
-                        counter++
-                    }
-                }
-                it.onSuccess(bookmarks)
-            }
-
-    private class SearchFilter internal constructor(
-            var suggestionsRepository: SuggestionsRepository,
-            private val suggestionsAdapter: SuggestionsAdapter,
-            private val historyModel: HistoryRepository,
-            private val databaseScheduler: Scheduler,
-            private val networkScheduler: Scheduler
+    private class SearchFilter(
+        private val suggestionsAdapter: SuggestionsAdapter
     ) : Filter() {
 
-        private var networkDisposable: Disposable? = null
-        private var historyDisposable: Disposable? = null
-        private var bookmarkDisposable: Disposable? = null
+        private val publishSubject = PublishSubject.create<CharSequence>()
 
-        override fun performFiltering(constraint: CharSequence?): Filter.FilterResults {
-            val results = Filter.FilterResults()
-            if (constraint == null || constraint.isEmpty()) {
-                suggestionsAdapter.clearSuggestions()
-                return results
+        fun input(): Observable<CharSequence> = publishSubject.hide()
+
+        override fun performFiltering(constraint: CharSequence?): FilterResults {
+            if (constraint?.isBlank() != false) {
+                return FilterResults()
             }
-            val query = constraint.toString().toLowerCase(Locale.getDefault()).trim()
+            publishSubject.onNext(constraint.trim())
 
-            if (networkDisposable?.isDisposed != false) {
-                networkDisposable = suggestionsRepository.resultsForSearch(query)
-                        .subscribeOn(networkScheduler)
-                        .observeOn(AndroidSchedulers.mainThread())
-                        .subscribe { item ->
-                            suggestionsAdapter.combineResults(null, null, item)
-                        }
-            }
-
-            if (bookmarkDisposable?.isDisposed != false) {
-                bookmarkDisposable = suggestionsAdapter.getBookmarksForQuery(query)
-                        .subscribeOn(databaseScheduler)
-                        .observeOn(AndroidSchedulers.mainThread())
-                        .subscribe { list ->
-                            suggestionsAdapter.combineResults(list, null, null)
-                        }
-            }
-
-            if (historyDisposable?.isDisposed != false) {
-                historyDisposable = historyModel.findHistoryItemsContaining(query)
-                        .subscribeOn(databaseScheduler)
-                        .observeOn(AndroidSchedulers.mainThread())
-                        .subscribe { list ->
-                            suggestionsAdapter.combineResults(null, list, null)
-                        }
-            }
-
-            results.count = 1
-            return results
+            return FilterResults().apply { count = 1 }
         }
 
-        override fun convertResultToString(resultValue: Any) = (resultValue as HistoryItem).url
+        override fun convertResultToString(resultValue: Any) = (resultValue as WebPage).url
 
-        override fun publishResults(constraint: CharSequence?, results: Filter.FilterResults?) =
-                suggestionsAdapter.combineResults(null, null, null)
-    }
-
-    private class SuggestionsComparator : Comparator<HistoryItem> {
-
-        override fun compare(lhs: HistoryItem, rhs: HistoryItem): Int {
-            if (lhs.imageId == rhs.imageId) return 0
-            if (lhs.imageId == R.drawable.ic_bookmark) return -1
-            if (rhs.imageId == R.drawable.ic_bookmark) return 1
-            if (lhs.imageId == R.drawable.ic_history) return -1
-            return 1
-        }
+        override fun publishResults(constraint: CharSequence?, results: FilterResults?) =
+            suggestionsAdapter.publishResults(null)
     }
 
 }

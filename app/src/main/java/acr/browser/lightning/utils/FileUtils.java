@@ -4,20 +4,18 @@ import android.app.Application;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Parcel;
-import android.support.annotation.NonNull;
-import android.support.annotation.Nullable;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import android.util.Log;
 
-import com.anthonycr.bonsai.Schedulers;
-
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.PrintStream;
+
+import io.reactivex.Completable;
 
 /**
  * A utility class containing helpful methods
@@ -41,25 +39,22 @@ public final class FileUtils {
      * @param bundle the bundle to store in persistent storage.
      * @param name   the name of the file to store the bundle in.
      */
-    public static void writeBundleToStorage(final @NonNull Application app, final Bundle bundle, final @NonNull String name) {
-        Schedulers.io().execute(new Runnable() {
-            @Override
-            public void run() {
-                File outputFile = new File(app.getFilesDir(), name);
-                FileOutputStream outputStream = null;
-                try {
-                    //noinspection IOResourceOpenedButNotSafelyClosed
-                    outputStream = new FileOutputStream(outputFile);
-                    Parcel parcel = Parcel.obtain();
-                    parcel.writeBundle(bundle);
-                    outputStream.write(parcel.marshall());
-                    outputStream.flush();
-                    parcel.recycle();
-                } catch (IOException e) {
-                    Log.e(TAG, "Unable to write bundle to storage");
-                } finally {
-                    Utils.close(outputStream);
-                }
+    public static Completable writeBundleToStorage(final @NonNull Application app, final Bundle bundle, final @NonNull String name) {
+        return Completable.fromAction(() -> {
+            File outputFile = new File(app.getFilesDir(), name);
+            FileOutputStream outputStream = null;
+            try {
+                //noinspection IOResourceOpenedButNotSafelyClosed
+                outputStream = new FileOutputStream(outputFile);
+                Parcel parcel = Parcel.obtain();
+                parcel.writeBundle(bundle);
+                outputStream.write(parcel.marshall());
+                outputStream.flush();
+                parcel.recycle();
+            } catch (IOException e) {
+                Log.e(TAG, "Unable to write bundle to storage");
+            } finally {
+                Utils.close(outputStream);
             }
         });
     }
@@ -140,19 +135,6 @@ public final class FileUtils {
         } finally {
             Utils.close(outputStream);
         }
-    }
-
-    @NonNull
-    public static String readStringFromStream(@NonNull final InputStream inputStream,
-                                              @NonNull final String encoding) throws IOException {
-        final ByteArrayOutputStream result = new ByteArrayOutputStream();
-        final byte[] buffer = new byte[1024];
-        int length;
-        while ((length = inputStream.read(buffer)) != -1) {
-            result.write(buffer, 0, length);
-        }
-
-        return result.toString(encoding);
     }
 
     /**

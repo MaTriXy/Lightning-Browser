@@ -4,17 +4,18 @@
 package acr.browser.lightning.controller
 
 import acr.browser.lightning.browser.TabsManager
-import acr.browser.lightning.database.HistoryItem
+import acr.browser.lightning.database.Bookmark
 import acr.browser.lightning.dialog.LightningDialogBuilder
 import acr.browser.lightning.view.LightningView
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Message
-import android.support.annotation.ColorInt
 import android.view.View
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient.CustomViewCallback
+import androidx.annotation.ColorInt
 
 /**
  * The monolithic controller that routes events between views in the browser.
@@ -28,10 +29,9 @@ interface UIController {
     fun getUiColor(): Int
 
     /**
-     * @return whether or not the UI is currently themed in dark mode. True if it is in dark theme,
-     * false otherwise.
+     * @return true if color mode is enabled, false otherwise.
      */
-    fun getUseDarkTheme(): Boolean
+    fun isColorMode(): Boolean
 
     /**
      * @return the tab model which contains all the tabs presented to the user.
@@ -46,7 +46,7 @@ interface UIController {
      * @param tabBackground the background of the tab, only used when tabs are not displayed in the
      * drawer.
      */
-    fun changeToolbarBackground(favicon: Bitmap, tabBackground: Drawable?)
+    fun changeToolbarBackground(favicon: Bitmap?, tabBackground: Drawable?)
 
     /**
      * Updates the current URL of the page.
@@ -84,12 +84,11 @@ interface UIController {
     /**
      * Notify the controller that it should display the custom [view] in full-screen to the user.
      */
-    fun onShowCustomView(view: View, callback: CustomViewCallback)
-
-    /**
-     * Notify the controller that it should display the custom [view] in full-screen to the user.
-     */
-    fun onShowCustomView(view: View, callback: CustomViewCallback, requestedOrientation: Int)
+    fun onShowCustomView(
+        view: View,
+        callback: CustomViewCallback,
+        requestedOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+    )
 
     /**
      * Notify the controller that it should hide the custom view which was previously displayed in
@@ -151,9 +150,9 @@ interface UIController {
     fun bookmarkButtonClicked()
 
     /**
-     * Notify the browser that the user clicked on the bookmark [item].
+     * Notify the browser that the user clicked on the bookmark [entry].
      */
-    fun bookmarkItemClicked(item: HistoryItem)
+    fun bookmarkItemClicked(entry: Bookmark.Entry)
 
     /**
      * Notify the UI that the forward button should be [enabled] for interaction.
@@ -191,9 +190,9 @@ interface UIController {
     fun handleBookmarksChange()
 
     /**
-     * Notify the browser that the provided bookmark [item] has changed.
+     * Notify the browser that the provided bookmark [bookmark] has changed.
      */
-    fun handleBookmarkDeleted(item: HistoryItem)
+    fun handleBookmarkDeleted(bookmark: Bookmark)
 
     /**
      * Notify the browser that the download list has changed.

@@ -4,46 +4,47 @@
 
 package acr.browser.lightning.view
 
-import acr.browser.lightning.BrowserApp
+import acr.browser.lightning.Capabilities
+import acr.browser.lightning.R
 import acr.browser.lightning.constant.DESKTOP_USER_AGENT
-import acr.browser.lightning.constant.MOBILE_USER_AGENT
-import acr.browser.lightning.constant.SCHEME_BOOKMARKS
-import acr.browser.lightning.constant.SCHEME_HOMEPAGE
 import acr.browser.lightning.controller.UIController
+import acr.browser.lightning.di.DatabaseScheduler
+import acr.browser.lightning.di.MainScheduler
+import acr.browser.lightning.di.injector
 import acr.browser.lightning.dialog.LightningDialogBuilder
 import acr.browser.lightning.download.LightningDownloadListener
-import acr.browser.lightning.html.bookmark.BookmarkPage
-import acr.browser.lightning.html.download.DownloadsPage
-import acr.browser.lightning.html.homepage.StartPage
+import acr.browser.lightning.extensions.drawable
+import acr.browser.lightning.isSupported
+import acr.browser.lightning.log.Logger
+import acr.browser.lightning.network.NetworkConnectivityModel
 import acr.browser.lightning.preference.UserPreferences
-import acr.browser.lightning.ssl.SSLState
-import acr.browser.lightning.utils.ProxyUtils
-import acr.browser.lightning.utils.UrlUtils
-import acr.browser.lightning.utils.Utils
+import acr.browser.lightning.preference.userAgent
+import acr.browser.lightning.ssl.SslState
+import acr.browser.lightning.utils.*
+import acr.browser.lightning.view.find.FindResults
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.Context
 import android.graphics.*
+import android.net.http.SslCertificate
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Message
-import android.support.v4.util.ArrayMap
-import android.util.Log
 import android.view.*
 import android.view.GestureDetector.SimpleOnGestureListener
 import android.view.View.OnTouchListener
 import android.webkit.CookieManager
 import android.webkit.WebSettings
 import android.webkit.WebSettings.LayoutAlgorithm
-import android.webkit.WebSettings.PluginState
 import android.webkit.WebView
+import androidx.collection.ArrayMap
+import androidx.core.graphics.drawable.toBitmap
 import io.reactivex.Observable
 import io.reactivex.Scheduler
 import io.reactivex.Single
-import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.disposables.Disposable
 import java.lang.ref.WeakReference
 import javax.inject.Inject
-import javax.inject.Named
 
 /**
  * [LightningView] acts as a tab for the browser, handling WebView creation and handling logic, as
@@ -51,30 +52,43 @@ import javax.inject.Named
  * class.
  */
 class LightningView(
-        private val activity: Activity,
-        url: String?,
-        val isIncognito: Boolean
+    private val activity: Activity,
+    tabInitializer: TabInitializer,
+    val isIncognito: Boolean,
+    private val homePageInitializer: HomePageInitializer,
+    private val bookmarkPageInitializer: BookmarkPageInitializer,
+    private val downloadPageInitializer: DownloadPageInitializer,
+    private val logger: Logger
 ) {
+
+    /**
+     * The unique ID of the view.
+     */
+    val id = View.generateViewId()
 
     /**
      * Getter for the [LightningViewTitle] of the current LightningView instance.
      *
      * @return a NonNull instance of LightningViewTitle
+     * @return a NonNull instance of LightningViewTitle
      */
     val titleInfo: LightningViewTitle
+
+    /**
+     * A tab initializer that should be run when the view is first attached.
+     */
+    private var latentTabInitializer: FreezableBundleInitializer? = null
 
     /**
      * Gets the current WebView instance of the tab.
      *
      * @return the WebView instance of the tab, which can be null.
      */
-    @get:Synchronized
     var webView: WebView? = null
         private set
 
     private val uiController: UIController
     private val gestureDetector: GestureDetector
-    private val defaultUserAgent: String
     private val paint = Paint()
 
     /**
@@ -88,8 +102,15 @@ class LightningView(
     var isForegroundTab: Boolean = false
         set(isForeground) {
             field = isForeground
+            if (isForeground) {
+                webView?.let {
+                    latentTabInitializer?.initialize(it, requestHeaders)
+                    latentTabInitializer = null
+                }
+            }
             uiController.tabChanged(this)
         }
+
     /**
      * Gets whether or not the page rendering is inverted or not. The main purpose of this is to
      * indicate that JavaScript should be run at the end of a page load to invert only the images
@@ -110,15 +131,18 @@ class LightningView(
      */
     internal val requestHeaders = ArrayMap<String, String>()
 
-    private var homepage: String
     private val maxFling: Float
 
     @Inject internal lateinit var userPreferences: UserPreferences
     @Inject internal lateinit var dialogBuilder: LightningDialogBuilder
     @Inject internal lateinit var proxyUtils: ProxyUtils
-    @Inject @field:Named("database") internal lateinit var databaseScheduler: Scheduler
+    @Inject @field:DatabaseScheduler internal lateinit var databaseScheduler: Scheduler
+    @Inject @field:MainScheduler internal lateinit var mainScheduler: Scheduler
+    @Inject lateinit var networkConnectivityModel: NetworkConnectivityModel
 
     private val lightningWebClient: LightningWebClient
+
+    private val networkDisposable: Disposable
 
     /**
      * This method determines whether the current tab is visible or not.
@@ -152,8 +176,8 @@ class LightningView(
      *
      * @return a non-null Bitmap with the current favicon.
      */
-    val favicon: Bitmap
-        get() = titleInfo.getFavicon(uiController.getUseDarkTheme())
+    val favicon: Bitmap?
+        get() = titleInfo.getFavicon()
 
     /**
      * Get the current title of the page, retrieved from the title object.
@@ -162,6 +186,12 @@ class LightningView(
      */
     val title: String
         get() = titleInfo.getTitle() ?: ""
+
+    /**
+     * Get the current [SslCertificate] if there is any associated with the current page.
+     */
+    val sslCertificate: SslCertificate?
+        get() = webView?.certificate
 
     /**
      * Get the current URL of the WebView, or an empty string if the WebView is null or the URL is
@@ -173,127 +203,109 @@ class LightningView(
         get() = webView?.url ?: ""
 
     init {
-        BrowserApp.appComponent.inject(this)
+        activity.injector.inject(this)
         uiController = activity as UIController
-        val tab = WebView(activity).also { webView = it }
 
-        homepage = userPreferences.homepage
-
-        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.JELLY_BEAN) {
-            tab.id = View.generateViewId()
-        }
         titleInfo = LightningViewTitle(activity)
 
         maxFling = ViewConfiguration.get(activity).scaledMaximumFlingVelocity.toFloat()
-
-        tab.drawingCacheBackgroundColor = Color.WHITE
-        tab.isFocusableInTouchMode = true
-        tab.isFocusable = true
-        tab.isDrawingCacheEnabled = false
-        tab.setWillNotCacheDrawing(true)
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
-            tab.isAnimationCacheEnabled = false
-            tab.isAlwaysDrawnWithCacheEnabled = false
-        }
-        tab.setBackgroundColor(Color.WHITE)
-
-        tab.isScrollbarFadingEnabled = true
-        tab.isSaveEnabled = true
-        tab.setNetworkAvailable(true)
-        tab.webChromeClient = LightningChromeClient(activity, this)
         lightningWebClient = LightningWebClient(activity, this)
-        tab.webViewClient = lightningWebClient
-        tab.setDownloadListener(LightningDownloadListener(activity))
         gestureDetector = GestureDetector(activity, CustomGestureListener())
-        tab.setOnTouchListener(TouchListener())
-        defaultUserAgent = tab.settings.userAgentString
-        initializeSettings()
-        initializePreferences(activity)
 
-        if (url != null) {
-            if (!url.trim().isEmpty()) {
-                tab.loadUrl(url, requestHeaders)
-            } else {
-                // don't load anything, the user is looking for a blank tab
+        val tab = WebView(activity).also { webView = it }.apply {
+            id = this@LightningView.id
+
+            isFocusableInTouchMode = true
+            isFocusable = true
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                isAnimationCacheEnabled = false
+                isAlwaysDrawnWithCacheEnabled = false
             }
-        } else {
-            loadHomePage()
+            setBackgroundColor(Color.WHITE)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_YES
+            }
+
+            isScrollbarFadingEnabled = true
+            isSaveEnabled = true
+            setNetworkAvailable(true)
+            webChromeClient = LightningChromeClient(activity, this@LightningView)
+            webViewClient = lightningWebClient
+
+            setDownloadListener(LightningDownloadListener(activity))
+            setOnTouchListener(TouchListener())
+            initializeSettings()
         }
+        initializePreferences()
+
+        if (tabInitializer !is FreezableBundleInitializer) {
+            tabInitializer.initialize(tab, requestHeaders)
+        } else {
+            latentTabInitializer = tabInitializer
+            titleInfo.setTitle(tabInitializer.initialTitle)
+            titleInfo.setFavicon(activity.drawable(R.drawable.ic_frozen).toBitmap())
+        }
+
+        networkDisposable = networkConnectivityModel.connectivity()
+            .observeOn(mainScheduler)
+            .subscribe(::setNetworkAvailable)
     }
 
-    fun currentSslState(): SSLState = lightningWebClient.sslState
+    fun currentSslState(): SslState = lightningWebClient.sslState
 
-    fun sslStateObservable(): Observable<SSLState> = lightningWebClient.sslStateObservable()
+    fun sslStateObservable(): Observable<SslState> = lightningWebClient.sslStateObservable()
 
     /**
      * This method loads the homepage for the browser. Either it loads the URL stored as the
      * homepage, or loads the startpage or bookmark page if either of those are set as the homepage.
      */
     fun loadHomePage() {
-        if (webView == null) {
-            return
-        }
+        reinitialize(homePageInitializer)
+    }
 
-        when (requireNotNull(homepage)) {
-            SCHEME_HOMEPAGE -> loadStartPage()
-            SCHEME_BOOKMARKS -> loadBookmarkPage()
-            else -> webView?.loadUrl(homepage, requestHeaders)
-        }
+    private fun reinitialize(tabInitializer: TabInitializer) {
+        webView?.let { tabInitializer.initialize(it, requestHeaders) }
     }
 
     /**
-     * This method gets the HomePage URL from the [StartPage] class asynchronously and loads the
-     * URL in the WebView on the UI thread.
-     */
-    private fun loadStartPage() {
-        StartPage()
-                .createHomePage()
-                .subscribeOn(databaseScheduler)
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(this::loadUrl)
-    }
-
-    /**
-     * This method gets the bookmark page URL from the [BookmarkPage] class asynchronously and loads
-     * the URL in the WebView on the UI thread. It also caches the default folder icon locally.
+     * This function loads the bookmark page via the [BookmarkPageInitializer].
      */
     fun loadBookmarkPage() {
-        BookmarkPage(activity)
-                .createBookmarkPage()
-                .subscribeOn(databaseScheduler)
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(this::loadUrl)
+        reinitialize(bookmarkPageInitializer)
     }
 
     /**
-     * This method gets the bookmark page URL from the [BookmarkPage] class asynchronously and loads
-     * the URL in the WebView on the UI thread. It also caches the default folder icon locally.
+     * This function loads the download page via the [DownloadPageInitializer].
      */
     fun loadDownloadsPage() {
-        DownloadsPage()
-                .getDownloadsPage()
-                .subscribeOn(databaseScheduler)
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(this::loadUrl)
+        reinitialize(downloadPageInitializer)
     }
 
     /**
      * Initialize the preference driven settings of the WebView. This method must be called whenever
      * the preferences are changed within SharedPreferences.
-     *
-     * @param context the context in which the WebView was created, it is used to get the default
-     * UserAgent for the WebView.
      */
     @SuppressLint("NewApi", "SetJavaScriptEnabled")
-    fun initializePreferences(context: Context) {
+    fun initializePreferences() {
         val settings = webView?.settings ?: return
 
         lightningWebClient.updatePreferences()
+
+        val modifiesHeaders = userPreferences.doNotTrackEnabled
+            || userPreferences.saveDataEnabled
+            || userPreferences.removeIdentifyingHeadersEnabled
 
         if (userPreferences.doNotTrackEnabled) {
             requestHeaders[HEADER_DNT] = "1"
         } else {
             requestHeaders.remove(HEADER_DNT)
+        }
+
+        if (userPreferences.saveDataEnabled) {
+            requestHeaders[HEADER_SAVEDATA] = "on"
+        } else {
+            requestHeaders.remove(HEADER_SAVEDATA)
         }
 
         if (userPreferences.removeIdentifyingHeadersEnabled) {
@@ -305,7 +317,6 @@ class LightningView(
         }
 
         settings.defaultTextEncodingName = userPreferences.textEncoding
-        homepage = userPreferences.homepage
         setColorMode(userPreferences.renderingMode)
 
         if (!isIncognito) {
@@ -313,29 +324,10 @@ class LightningView(
         } else {
             settings.setGeolocationEnabled(false)
         }
-        if (API < Build.VERSION_CODES.KITKAT) {
-            when (userPreferences.flashSupport) {
-                0 -> settings.pluginState = PluginState.OFF
-                1 -> settings.pluginState = PluginState.ON_DEMAND
-                2 -> settings.pluginState = PluginState.ON
-                else -> {
-                }
-            }
-        }
 
-        setUserAgent(context, userPreferences.userAgentChoice)
+        setUserAgentForPreference(userPreferences)
 
-        if (userPreferences.savePasswordsEnabled && !isIncognito) {
-            if (API < Build.VERSION_CODES.JELLY_BEAN_MR2) {
-                settings.savePassword = true
-            }
-            settings.saveFormData = true
-        } else {
-            if (API < Build.VERSION_CODES.JELLY_BEAN_MR2) {
-                settings.savePassword = false
-            }
-            settings.saveFormData = false
-        }
+        settings.saveFormData = userPreferences.savePasswordsEnabled && !isIncognito
 
         if (userPreferences.javaScriptEnabled) {
             settings.javaScriptEnabled = true
@@ -347,28 +339,22 @@ class LightningView(
 
         if (userPreferences.textReflowEnabled) {
             settings.layoutAlgorithm = LayoutAlgorithm.NARROW_COLUMNS
-            if (API >= android.os.Build.VERSION_CODES.KITKAT) {
-                try {
-                    settings.layoutAlgorithm = LayoutAlgorithm.TEXT_AUTOSIZING
-                } catch (e: Exception) {
-                    // This shouldn't be necessary, but there are a number
-                    // of KitKat devices that crash trying to set this
-                    Log.e(TAG, "Problem setting LayoutAlgorithm to TEXT_AUTOSIZING")
-                }
-
+            try {
+                settings.layoutAlgorithm = LayoutAlgorithm.TEXT_AUTOSIZING
+            } catch (e: Exception) {
+                // This shouldn't be necessary, but there are a number
+                // of KitKat devices that crash trying to set this
+                logger.log(TAG, "Problem setting LayoutAlgorithm to TEXT_AUTOSIZING")
             }
         } else {
             settings.layoutAlgorithm = LayoutAlgorithm.NORMAL
         }
 
         settings.blockNetworkImage = userPreferences.blockImagesEnabled
-        if (!isIncognito) {
-            settings.setSupportMultipleWindows(userPreferences.popupsEnabled)
-        } else {
-            settings.setSupportMultipleWindows(false)
-        }
+        // Modifying headers causes SEGFAULTS, so disallow multi window if headers are enabled.
+        settings.setSupportMultipleWindows(userPreferences.popupsEnabled && !modifiesHeaders)
 
-        settings.useWideViewPort = userPreferences.useWideViewportEnabled
+        settings.useWideViewPort = userPreferences.useWideViewPortEnabled
         settings.loadWithOverviewMode = userPreferences.overviewModeEnabled
         settings.textZoom = when (userPreferences.textSize) {
             0 -> 200
@@ -382,7 +368,7 @@ class LightningView(
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             CookieManager.getInstance().setAcceptThirdPartyCookies(webView,
-                    !userPreferences.blockThirdPartyCookiesEnabled)
+                !userPreferences.blockThirdPartyCookiesEnabled)
         }
     }
 
@@ -391,75 +377,52 @@ class LightningView(
      * by the user. Distinguish between Incognito and Regular tabs here.
      */
     @SuppressLint("NewApi")
-    private fun initializeSettings() {
-        val settings = webView?.settings ?: return
+    private fun WebView.initializeSettings() {
+        settings.apply {
+            mediaPlaybackRequiresUserGesture = true
 
-        if (API < Build.VERSION_CODES.JELLY_BEAN_MR2) {
-            settings.setAppCacheMaxSize(java.lang.Long.MAX_VALUE)
-        }
+            if (API >= Build.VERSION_CODES.LOLLIPOP && !isIncognito) {
+                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            } else if (API >= Build.VERSION_CODES.LOLLIPOP) {
+                // We're in Incognito mode, reject
+                mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            }
 
-        if (API < Build.VERSION_CODES.JELLY_BEAN_MR1) {
-            settings.setEnableSmoothTransition(true)
-        }
+            if (!isIncognito || Capabilities.FULL_INCOGNITO.isSupported) {
+                domStorageEnabled = true
+                setAppCacheEnabled(true)
+                databaseEnabled = true
+                cacheMode = WebSettings.LOAD_DEFAULT
+            } else {
+                domStorageEnabled = false
+                setAppCacheEnabled(false)
+                databaseEnabled = false
+                cacheMode = WebSettings.LOAD_NO_CACHE
+            }
 
-        if (API > Build.VERSION_CODES.JELLY_BEAN) {
-            settings.mediaPlaybackRequiresUserGesture = true
-        }
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
+            allowContentAccess = true
+            allowFileAccess = true
+            allowFileAccessFromFileURLs = false
+            allowUniversalAccessFromFileURLs = false
 
-        if (API >= Build.VERSION_CODES.LOLLIPOP && !isIncognito) {
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        } else if (API >= Build.VERSION_CODES.LOLLIPOP) {
-            // We're in Incognito mode, reject
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        }
-
-        if (!isIncognito) {
-            settings.domStorageEnabled = true
-            settings.setAppCacheEnabled(true)
-            settings.cacheMode = WebSettings.LOAD_DEFAULT
-            settings.databaseEnabled = true
-        } else {
-            settings.domStorageEnabled = false
-            settings.setAppCacheEnabled(false)
-            settings.databaseEnabled = false
-            settings.cacheMode = WebSettings.LOAD_NO_CACHE
-        }
-
-        settings.setSupportZoom(true)
-        settings.builtInZoomControls = true
-        settings.displayZoomControls = false
-        settings.allowContentAccess = true
-        settings.allowFileAccess = true
-
-        if (API >= Build.VERSION_CODES.JELLY_BEAN) {
-            settings.allowFileAccessFromFileURLs = false
-            settings.allowUniversalAccessFromFileURLs = false
-        }
-
-        getPathObservable("appcache")
+            getPathObservable("appcache")
                 .subscribeOn(databaseScheduler)
-                .observeOn(AndroidSchedulers.mainThread())
+                .observeOn(mainScheduler)
                 .subscribe { file ->
-                    settings.setAppCachePath(requireNotNull(file).path)
+                    setAppCachePath(file.path)
                 }
 
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-            getPathObservable("geolocation")
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                getPathObservable("geolocation")
                     .subscribeOn(databaseScheduler)
-                    .observeOn(AndroidSchedulers.mainThread())
+                    .observeOn(mainScheduler)
                     .subscribe { file ->
-                        settings.setGeolocationDatabasePath(requireNotNull(file).path)
+                        setGeolocationDatabasePath(file.path)
                     }
-        }
-
-
-        if (API < Build.VERSION_CODES.KITKAT) {
-            getPathObservable("databases")
-                    .subscribeOn(databaseScheduler)
-                    .observeOn(AndroidSchedulers.mainThread())
-                    .subscribe { file ->
-                        settings.databasePath = requireNotNull(file).path
-                    }
+            }
         }
 
     }
@@ -471,86 +434,51 @@ class LightningView(
     /**
      * This method is used to toggle the user agent between desktop and the current preference of
      * the user.
-     *
-     * @param context the Context needed to set the user agent
      */
-    fun toggleDesktopUA(context: Context) {
+    fun toggleDesktopUA() {
         if (!toggleDesktop) {
             webView?.settings?.userAgentString = DESKTOP_USER_AGENT
         } else {
-            setUserAgent(context, userPreferences.userAgentChoice)
+            setUserAgentForPreference(userPreferences)
         }
 
         toggleDesktop = !toggleDesktop
     }
 
     /**
-     * This method sets the user agent of the current tab. There are four options, 1, 2, 3, 4.
-     *
-     * 1. use the default user agent
-     * 2. use the desktop user agent
-     * 3. use the mobile user agent
-     * 4. use a custom user agent, or the default user agent if none was set.
-     *
-     * @param context the context needed to get the default user agent.
-     * @param choice  the choice of user agent to use, see above comments.
+     * This method sets the user agent of the current tab based on the user's preference
      */
-    @SuppressLint("NewApi")
-    private fun setUserAgent(context: Context, choice: Int) {
-        val settings = webView?.settings ?: return
-
-        when (choice) {
-            1 -> if (API >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-                settings.userAgentString = WebSettings.getDefaultUserAgent(context)
-            } else {
-                settings.userAgentString = defaultUserAgent
-            }
-            2 -> settings.userAgentString = DESKTOP_USER_AGENT
-            3 -> settings.userAgentString = MOBILE_USER_AGENT
-            4 -> {
-                var ua = userPreferences.userAgentString
-                if (ua.isEmpty()) {
-                    ua = " "
-                }
-                settings.userAgentString = ua
-            }
-        }
+    private fun setUserAgentForPreference(userPreferences: UserPreferences) {
+        webView?.settings?.userAgentString = userPreferences.userAgent(activity.application)
     }
+
+    /**
+     * Save the state of the tab and return it as a [Bundle].
+     */
+    fun saveState(): Bundle = latentTabInitializer?.bundle
+        ?: Bundle(ClassLoader.getSystemClassLoader()).also {
+            webView?.saveState(it)
+        }
 
     /**
      * Pause the current WebView instance.
      */
-    @Synchronized
     fun onPause() {
         webView?.onPause()
-        Log.d(TAG, "WebView onPause: " + webView?.id)
+        logger.log(TAG, "WebView onPause: ${webView?.id}")
     }
 
     /**
      * Resume the current WebView instance.
      */
-    @Synchronized
     fun onResume() {
         webView?.onResume()
-        Log.d(TAG, "WebView onResume: " + webView?.id)
-    }
-
-    /**
-     * Notify the LightningView that there is low memory and
-     * for the WebView to free memory. Only applicable on
-     * pre-Lollipop devices.
-     */
-    @Synchronized
-    fun freeMemory() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
-            webView?.freeMemory()
-        }
+        logger.log(TAG, "WebView onResume: ${webView?.id}")
     }
 
     /**
      * Notify the WebView to stop the current load.
      */
-    @Synchronized
     fun stopLoading() {
         webView?.stopLoading()
     }
@@ -586,17 +514,17 @@ class LightningView(
     /**
      * Sets the current rendering color of the WebView instance
      * of the current LightningView. The for modes are normal
-     * rendering (0), inverted rendering (1), grayscale rendering (2),
-     * and inverted grayscale rendering (3)
+     * rendering, inverted rendering, grayscale rendering,
+     * and inverted grayscale rendering
      *
      * @param mode the integer mode to set as the rendering mode.
      * see the numbers in documentation above for the
      * values this method accepts.
      */
-    private fun setColorMode(mode: Int) {
+    private fun setColorMode(mode: RenderingMode) {
         invertPage = false
         when (mode) {
-            0 -> {
+            RenderingMode.NORMAL -> {
                 paint.colorFilter = null
                 // setSoftwareRendering(); // Some devices get segfaults
                 // in the WebView with Hardware Acceleration enabled,
@@ -604,24 +532,24 @@ class LightningView(
                 setNormalRendering()
                 invertPage = false
             }
-            1 -> {
+            RenderingMode.INVERTED -> {
                 val filterInvert = ColorMatrixColorFilter(
-                        sNegativeColorArray)
+                    negativeColorArray)
                 paint.colorFilter = filterInvert
                 setHardwareRendering()
 
                 invertPage = true
             }
-            2 -> {
+            RenderingMode.GRAYSCALE -> {
                 val cm = ColorMatrix()
                 cm.setSaturation(0f)
                 val filterGray = ColorMatrixColorFilter(cm)
                 paint.colorFilter = filterGray
                 setHardwareRendering()
             }
-            3 -> {
+            RenderingMode.INVERTED_GRAYSCALE -> {
                 val matrix = ColorMatrix()
-                matrix.set(sNegativeColorArray)
+                matrix.set(negativeColorArray)
                 val matrixGray = ColorMatrix()
                 matrixGray.setSaturation(0f)
                 val concat = ColorMatrix()
@@ -633,8 +561,8 @@ class LightningView(
                 invertPage = true
             }
 
-            4 -> {
-                val increaseHighContrast = ColorMatrixColorFilter(sIncreaseContrastColorArray)
+            RenderingMode.INCREASE_CONTRAST -> {
+                val increaseHighContrast = ColorMatrixColorFilter(increaseContrastColorArray)
                 paint.colorFilter = increaseHighContrast
                 setHardwareRendering()
             }
@@ -647,10 +575,9 @@ class LightningView(
      * WebView instance, which will trigger a
      * pause for all WebViews in the app.
      */
-    @Synchronized
     fun pauseTimers() {
         webView?.pauseTimers()
-        Log.d(TAG, "Pausing JS timers")
+        logger.log(TAG, "Pausing JS timers")
     }
 
     /**
@@ -658,10 +585,9 @@ class LightningView(
      * WebView instance, which will trigger a
      * resume for all WebViews in the app.
      */
-    @Synchronized
     fun resumeTimers() {
         webView?.resumeTimers()
-        Log.d(TAG, "Resuming JS timers")
+        logger.log(TAG, "Resuming JS timers")
     }
 
     /**
@@ -691,7 +617,6 @@ class LightningView(
      * this method will not have an affect as the
      * proxy must start before the load occurs.
      */
-    @Synchronized
     fun reload() {
         // Check if configured proxy is available
         if (!proxyUtils.isProxyReady(activity)) {
@@ -710,12 +635,21 @@ class LightningView(
      * @param text the text to search for.
      */
     @SuppressLint("NewApi")
-    @Synchronized
-    fun find(text: String) {
-        if (API >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-            webView?.findAllAsync(text)
-        } else {
-            webView?.findAll(text)
+    fun find(text: String): FindResults {
+        webView?.findAllAsync(text)
+
+        return object : FindResults {
+            override fun nextResult() {
+                webView?.findNext(true)
+            }
+
+            override fun previousResult() {
+                webView?.findNext(false)
+            }
+
+            override fun clearResults() {
+                webView?.clearMatches()
+            }
         }
     }
 
@@ -730,14 +664,14 @@ class LightningView(
     // TODO fix bug where WebView.destroy is being called before the tab
     // is removed and would cause a memory leak if the parent check
     // was not in place.
-    @Synchronized
     fun onDestroy() {
+        networkDisposable.dispose()
         webView?.let { tab ->
             // Check to make sure the WebView has been removed
             // before calling destroy() so that a memory leak is not created
             val parent = tab.parent as? ViewGroup
             if (parent != null) {
-                Log.e(TAG, "WebView was not detached from window before onDestroy")
+                logger.log(TAG, "WebView was not detached from window before onDestroy")
                 parent.removeView(webView)
             }
             tab.stopLoading()
@@ -746,10 +680,7 @@ class LightningView(
             tab.visibility = View.GONE
             tab.removeAllViews()
             tab.destroyDrawingCache()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
-                //this is causing the segfault occasionally below 4.2
-                tab.destroy()
-            }
+            tab.destroy()
 
             webView = null
         }
@@ -759,7 +690,6 @@ class LightningView(
      * Tell the WebView to navigate backwards
      * in its history to the previous page.
      */
-    @Synchronized
     fun goBack() {
         webView?.goBack()
     }
@@ -768,41 +698,15 @@ class LightningView(
      * Tell the WebView to navigate forwards
      * in its history to the next page.
      */
-    @Synchronized
     fun goForward() {
         webView?.goForward()
     }
 
     /**
-     * Move the highlighted text in the WebView
-     * to the next matched text. This method will
-     * only have an affect after [LightningView.find]
-     * is called. Otherwise it will do nothing.
+     * Notifies the [WebView] whether the network is available or not.
      */
-    @Synchronized
-    fun findNext() {
-        webView?.findNext(true)
-    }
-
-    /**
-     * Move the highlighted text in the WebView
-     * to the previous matched text. This method will
-     * only have an affect after [LightningView.find]
-     * is called. Otherwise it will do nothing.
-     */
-    @Synchronized
-    fun findPrevious() {
-        webView?.findNext(false)
-    }
-
-    /**
-     * Clear the highlighted text in the WebView after
-     * [LightningView.find] has been called.
-     * Otherwise it will have no affect.
-     */
-    @Synchronized
-    fun clearFindMatches() {
-        webView?.clearMatches()
+    private fun setNetworkAvailable(isAvailable: Boolean) {
+        webView?.setNetworkAvailable(isAvailable)
     }
 
     /**
@@ -817,27 +721,25 @@ class LightningView(
     private fun longClickPage(url: String?) {
         val result = webView?.hitTestResult
         val currentUrl = webView?.url
+        val newUrl = result?.extra
 
-        if (currentUrl != null && UrlUtils.isSpecialUrl(currentUrl)) {
-            if (UrlUtils.isHistoryUrl(currentUrl)) {
+        if (currentUrl != null && currentUrl.isSpecialUrl()) {
+            if (currentUrl.isHistoryUrl()) {
                 if (url != null) {
                     dialogBuilder.showLongPressedHistoryLinkDialog(activity, uiController, url)
-                } else if (result != null && result.extra != null) {
-                    val newUrl = result.extra
+                } else if (newUrl != null) {
                     dialogBuilder.showLongPressedHistoryLinkDialog(activity, uiController, newUrl)
                 }
-            } else if (UrlUtils.isBookmarkUrl(currentUrl)) {
+            } else if (currentUrl.isBookmarkUrl()) {
                 if (url != null) {
                     dialogBuilder.showLongPressedDialogForBookmarkUrl(activity, uiController, url)
-                } else if (result != null && result.extra != null) {
-                    val newUrl = result.extra
+                } else if (newUrl != null) {
                     dialogBuilder.showLongPressedDialogForBookmarkUrl(activity, uiController, newUrl)
                 }
-            } else if (UrlUtils.isDownloadsUrl(currentUrl)) {
+            } else if (currentUrl.isDownloadsUrl()) {
                 if (url != null) {
                     dialogBuilder.showLongPressedDialogForDownloadUrl(activity, uiController, url)
-                } else if (result != null && result.extra != null) {
-                    val newUrl = result.extra
+                } else if (newUrl != null) {
                     dialogBuilder.showLongPressedDialogForDownloadUrl(activity, uiController, newUrl)
                 }
             }
@@ -852,8 +754,7 @@ class LightningView(
                 } else {
                     dialogBuilder.showLongPressLinkDialog(activity, uiController, url)
                 }
-            } else if (result != null && result.extra != null) {
-                val newUrl = result.extra
+            } else if (newUrl != null) {
                 if (result.type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE || result.type == WebView.HitTestResult.IMAGE_TYPE) {
                     dialogBuilder.showLongPressImageDialog(activity, uiController, newUrl, userAgent)
                 } else {
@@ -888,7 +789,6 @@ class LightningView(
      * @param url the non-null URL to attempt to load in
      * the WebView.
      */
-    @Synchronized
     fun loadUrl(url: String) {
         // Check if configured proxy is available
         if (!proxyUtils.isProxyReady(activity)) {
@@ -905,9 +805,9 @@ class LightningView(
      */
     private inner class TouchListener : OnTouchListener {
 
-        internal var location: Float = 0f
-        internal var y: Float = 0f
-        internal var action: Int = 0
+        var location: Float = 0f
+        var y: Float = 0f
+        var action: Int = 0
 
         @SuppressLint("ClickableViewAccessibility")
         override fun onTouch(view: View?, arg1: MotionEvent): Boolean {
@@ -1016,19 +916,22 @@ class LightningView(
         const val HEADER_REQUESTED_WITH = "X-Requested-With"
         const val HEADER_WAP_PROFILE = "X-Wap-Profile"
         private const val HEADER_DNT = "DNT"
+        private const val HEADER_SAVEDATA = "Save-Data"
 
-        private val API = android.os.Build.VERSION.SDK_INT
+        private val API = Build.VERSION.SDK_INT
         private val SCROLL_UP_THRESHOLD = Utils.dpToPx(10f)
 
-        private val sNegativeColorArray = floatArrayOf(-1.0f, 0f, 0f, 0f, 255f, // red
-                0f, -1.0f, 0f, 0f, 255f, // green
-                0f, 0f, -1.0f, 0f, 255f, // blue
-                0f, 0f, 0f, 1.0f, 0f // alpha
+        private val negativeColorArray = floatArrayOf(
+            -1.0f, 0f, 0f, 0f, 255f, // red
+            0f, -1.0f, 0f, 0f, 255f, // green
+            0f, 0f, -1.0f, 0f, 255f, // blue
+            0f, 0f, 0f, 1.0f, 0f // alpha
         )
-        private val sIncreaseContrastColorArray = floatArrayOf(2.0f, 0f, 0f, 0f, -160f, // red
-                0f, 2.0f, 0f, 0f, -160f, // green
-                0f, 0f, 2.0f, 0f, -160f, // blue
-                0f, 0f, 0f, 1.0f, 0f // alpha
+        private val increaseContrastColorArray = floatArrayOf(
+            2.0f, 0f, 0f, 0f, -160f, // red
+            0f, 2.0f, 0f, 0f, -160f, // green
+            0f, 0f, 2.0f, 0f, -160f, // blue
+            0f, 0f, 0f, 1.0f, 0f // alpha
         )
     }
 }

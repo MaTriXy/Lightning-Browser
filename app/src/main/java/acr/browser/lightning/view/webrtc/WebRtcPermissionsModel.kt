@@ -7,11 +7,14 @@ import android.webkit.PermissionRequest
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * The model that manages permission requests originating from a web page.
+ */
 @TargetApi(Build.VERSION_CODES.LOLLIPOP)
 @Singleton
 class WebRtcPermissionsModel @Inject constructor() {
 
-    private val resourceGrantMap = mutableMapOf<String, MutableSet<String>>()
+    private val resourceGrantMap = mutableMapOf<String, HashSet<String>>()
 
     /**
      * Request a permission from the user to use certain device resources. Will call either
@@ -21,11 +24,8 @@ class WebRtcPermissionsModel @Inject constructor() {
      * @param permissionRequest the request being made.
      * @param view the view that will delegate requesting permissions or resources from the user.
      */
-    fun requestPermission(
-            permissionRequest: PermissionRequest,
-            view: WebRtcPermissionsView
-    ) {
-        val host = permissionRequest.origin.host
+    fun requestPermission(permissionRequest: PermissionRequest, view: WebRtcPermissionsView) {
+        val host = permissionRequest.origin.host ?: ""
         val requiredResources = permissionRequest.resources
         val requiredPermissions = permissionRequest.requiredPermissions()
 
@@ -43,7 +43,7 @@ class WebRtcPermissionsModel @Inject constructor() {
                     view.requestPermissions(requiredPermissions) { permissionsGranted ->
                         if (permissionsGranted) {
                             resourceGrantMap[host]?.addAll(requiredResources)
-                                    ?: resourceGrantMap.put(host, requiredResources.toHashSet())
+                                ?: resourceGrantMap.put(host, requiredResources.toHashSet())
                             permissionRequest.grant(requiredResources)
                         } else {
                             permissionRequest.deny()

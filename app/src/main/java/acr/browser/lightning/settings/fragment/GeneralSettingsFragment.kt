@@ -1,11 +1,13 @@
 package acr.browser.lightning.settings.fragment
 
-import acr.browser.lightning.BrowserApp
-import acr.browser.lightning.BuildConfig
 import acr.browser.lightning.R
-import acr.browser.lightning.constant.*
+import acr.browser.lightning.browser.ProxyChoice
+import acr.browser.lightning.constant.SCHEME_BLANK
+import acr.browser.lightning.constant.SCHEME_BOOKMARKS
+import acr.browser.lightning.constant.SCHEME_HOMEPAGE
+import acr.browser.lightning.di.injector
 import acr.browser.lightning.dialog.BrowserDialog
-import acr.browser.lightning.dialog.DialogItem
+import acr.browser.lightning.extensions.withSingleChoiceItems
 import acr.browser.lightning.preference.UserPreferences
 import acr.browser.lightning.search.SearchEngineProvider
 import acr.browser.lightning.search.Suggestions
@@ -14,12 +16,9 @@ import acr.browser.lightning.search.engine.CustomSearch
 import acr.browser.lightning.utils.FileUtils
 import acr.browser.lightning.utils.ProxyUtils
 import acr.browser.lightning.utils.ThemeUtils
-import acr.browser.lightning.utils.Utils
 import android.app.Activity
-import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.support.v4.content.ContextCompat
 import android.text.Editable
 import android.text.InputFilter
 import android.text.TextWatcher
@@ -27,6 +26,7 @@ import android.view.LayoutInflater
 import android.webkit.URLUtil
 import android.widget.EditText
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import javax.inject.Inject
 
 /**
@@ -44,150 +44,108 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        BrowserApp.appComponent.inject(this)
+        injector.inject(this)
 
         proxyChoices = resources.getStringArray(R.array.proxy_choices_array)
 
         clickableDynamicPreference(
-                preference = SETTINGS_PROXY,
-                summary = proxyChoiceToSummary(userPreferences.proxyChoice),
-                onClick = this::showProxyPicker
+            preference = SETTINGS_PROXY,
+            summary = userPreferences.proxyChoice.toSummary(),
+            onClick = ::showProxyPicker
         )
 
         clickableDynamicPreference(
-                preference = SETTINGS_USER_AGENT,
-                summary = choiceToUserAgent(userPreferences.userAgentChoice),
-                onClick = this::showUserAgentChooserDialog
+            preference = SETTINGS_USER_AGENT,
+            summary = choiceToUserAgent(userPreferences.userAgentChoice),
+            onClick = ::showUserAgentChooserDialog
         )
 
         clickableDynamicPreference(
-                preference = SETTINGS_DOWNLOAD,
-                summary = userPreferences.downloadDirectory,
-                onClick = this::showDownloadLocationDialog
+            preference = SETTINGS_DOWNLOAD,
+            summary = userPreferences.downloadDirectory,
+            onClick = ::showDownloadLocationDialog
         )
 
         clickableDynamicPreference(
-                preference = SETTINGS_HOME,
-                summary = homePageUrlToDisplayTitle(userPreferences.homepage),
-                onClick = this::showHomePageDialog
+            preference = SETTINGS_HOME,
+            summary = homePageUrlToDisplayTitle(userPreferences.homepage),
+            onClick = ::showHomePageDialog
         )
 
         clickableDynamicPreference(
-                preference = SETTINGS_SEARCH_ENGINE,
-                summary = getSearchEngineSummary(searchEngineProvider.getCurrentSearchEngine()),
-                onClick = this::showSearchProviderDialog
+            preference = SETTINGS_SEARCH_ENGINE,
+            summary = getSearchEngineSummary(searchEngineProvider.provideSearchEngine()),
+            onClick = ::showSearchProviderDialog
         )
 
         clickableDynamicPreference(
-                preference = SETTINGS_SUGGESTIONS,
-                summary = searchSuggestionChoiceToTitle(Suggestions.from(userPreferences.searchSuggestionChoice)),
-                onClick = this::showSearchSuggestionsDialog
+            preference = SETTINGS_SUGGESTIONS,
+            summary = searchSuggestionChoiceToTitle(Suggestions.from(userPreferences.searchSuggestionChoice)),
+            onClick = ::showSearchSuggestionsDialog
         )
 
         checkBoxPreference(
-                preference = SETTINGS_FLASH,
-                isEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT,
-                summary = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
-                    null
-                } else {
-                    getString(R.string.flash_not_supported)
-                },
-                isChecked = userPreferences.flashSupport > 0,
-                onCheckChange = { checked ->
-                    if (!Utils.isFlashInstalled(activity) && checked) {
-                        Utils.createInformativeDialog(activity, R.string.title_warning, R.string.dialog_adobe_not_installed)
-                        userPreferences.flashSupport = 0
-                    } else {
-                        if (checked) {
-                            showFlashChoiceDialog()
-                        } else {
-                            userPreferences.flashSupport = 0
-                        }
-                    }
-                }
+            preference = SETTINGS_IMAGES,
+            isChecked = userPreferences.blockImagesEnabled,
+            onCheckChange = { userPreferences.blockImagesEnabled = it }
         )
 
         checkBoxPreference(
-                preference = SETTINGS_ADS,
-                isEnabled = BuildConfig.FULL_VERSION,
-                summary = if (BuildConfig.FULL_VERSION) {
-                    null
-                } else {
-                    getString(R.string.upsell_plus_version)
-                },
-                isChecked = BuildConfig.FULL_VERSION && userPreferences.adBlockEnabled,
-                onCheckChange = { userPreferences.adBlockEnabled = it }
+            preference = SETTINGS_SAVEDATA,
+            isChecked = userPreferences.saveDataEnabled,
+            onCheckChange = { userPreferences.saveDataEnabled = it }
         )
 
         checkBoxPreference(
-                preference = SETTINGS_IMAGES,
-                isChecked = userPreferences.blockImagesEnabled,
-                onCheckChange = { userPreferences.blockImagesEnabled = it }
+            preference = SETTINGS_JAVASCRIPT,
+            isChecked = userPreferences.javaScriptEnabled,
+            onCheckChange = { userPreferences.javaScriptEnabled = it }
         )
 
         checkBoxPreference(
-                preference = SETTINGS_JAVASCRIPT,
-                isChecked = userPreferences.javaScriptEnabled,
-                onCheckChange = { userPreferences.javaScriptEnabled = it }
-        )
-
-        checkBoxPreference(
-                preference = SETTINGS_COLOR_MODE,
-                isChecked = userPreferences.colorModeEnabled,
-                onCheckChange = { userPreferences.colorModeEnabled = it }
+            preference = SETTINGS_COLOR_MODE,
+            isChecked = userPreferences.colorModeEnabled,
+            onCheckChange = { userPreferences.colorModeEnabled = it }
         )
     }
 
-    private fun showFlashChoiceDialog() {
-        activity?.let {
-            BrowserDialog.showPositiveNegativeDialog(
-                    activity = it,
-                    title = R.string.title_flash,
-                    message = R.string.flash,
-                    positiveButton = DialogItem(
-                            title = R.string.action_manual,
-                            onClick = { userPreferences.flashSupport = 1 }
-                    ),
-                    negativeButton = DialogItem(
-                            title = R.string.action_auto,
-                            onClick = { userPreferences.flashSupport = 2 }
-                    ),
-                    onCancel = { userPreferences.flashSupport = 0 }
-            )
+    private fun ProxyChoice.toSummary(): String {
+        val stringArray = resources.getStringArray(R.array.proxy_choices_array)
+        return when (this) {
+            ProxyChoice.NONE -> stringArray[0]
+            ProxyChoice.ORBOT -> stringArray[1]
+            ProxyChoice.I2P -> stringArray[2]
+            ProxyChoice.MANUAL -> "${userPreferences.proxyHost}:${userPreferences.proxyPort}"
         }
-    }
-
-    private fun proxyChoiceToSummary(choice: Int) = when (choice) {
-        PROXY_MANUAL -> "${userPreferences.proxyHost}:${userPreferences.proxyPort}"
-        NO_PROXY,
-        PROXY_ORBOT,
-        PROXY_I2P -> proxyChoices[choice]
-        else -> proxyChoices[NO_PROXY]
     }
 
     private fun showProxyPicker(summaryUpdater: SummaryUpdater) {
         BrowserDialog.showCustomDialog(activity) {
             setTitle(R.string.http_proxy)
-            setSingleChoiceItems(proxyChoices, userPreferences.proxyChoice) { _, which ->
-                updateProxyChoice(which, it, summaryUpdater)
+            val stringArray = resources.getStringArray(R.array.proxy_choices_array)
+            val values = ProxyChoice.values().map {
+                Pair(it, when (it) {
+                    ProxyChoice.NONE -> stringArray[0]
+                    ProxyChoice.ORBOT -> stringArray[1]
+                    ProxyChoice.I2P -> stringArray[2]
+                    ProxyChoice.MANUAL -> stringArray[3]
+                })
+            }
+            withSingleChoiceItems(values, userPreferences.proxyChoice) {
+                updateProxyChoice(it, activity, summaryUpdater)
             }
             setPositiveButton(R.string.action_ok, null)
         }
     }
 
-    private fun updateProxyChoice(@Proxy choice: Int, activity: Activity, summaryUpdater: SummaryUpdater) {
+    private fun updateProxyChoice(choice: ProxyChoice, activity: Activity, summaryUpdater: SummaryUpdater) {
         val sanitizedChoice = ProxyUtils.sanitizeProxyChoice(choice, activity)
-        when (sanitizedChoice) {
-            PROXY_ORBOT,
-            PROXY_I2P,
-            NO_PROXY -> Unit
-            PROXY_MANUAL -> showManualProxyPicker(activity, summaryUpdater)
+        if (sanitizedChoice == ProxyChoice.MANUAL) {
+            showManualProxyPicker(activity, summaryUpdater)
         }
 
         userPreferences.proxyChoice = sanitizedChoice
-        if (sanitizedChoice < proxyChoices.size) {
-            summaryUpdater.updateSummary(proxyChoices[sanitizedChoice])
-        }
+        summaryUpdater.updateSummary(sanitizedChoice.toSummary())
     }
 
     private fun showManualProxyPicker(activity: Activity, summaryUpdater: SummaryUpdater) {
@@ -198,11 +156,11 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
         // Limit the number of characters since the port needs to be of type int
         // Use input filters to limit the EditText length and determine the max
         // length by using length of integer MAX_VALUE
-        val maxCharacters = Integer.toString(Integer.MAX_VALUE).length
+        val maxCharacters = Integer.MAX_VALUE.toString().length
         eProxyPort.filters = arrayOf<InputFilter>(InputFilter.LengthFilter(maxCharacters - 1))
 
         eProxyHost.text = userPreferences.proxyHost
-        eProxyPort.text = Integer.toString(userPreferences.proxyPort)
+        eProxyPort.text = userPreferences.proxyPort.toString()
 
         BrowserDialog.showCustomDialog(activity) {
             setTitle(R.string.manual_proxy)
@@ -253,10 +211,10 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
     private fun showCustomUserAgentPicker(summaryUpdater: SummaryUpdater) {
         activity?.let {
             BrowserDialog.showEditText(it,
-                    R.string.title_user_agent,
-                    R.string.title_user_agent,
-                    userPreferences.userAgentString,
-                    R.string.action_ok) { s ->
+                R.string.title_user_agent,
+                R.string.title_user_agent,
+                userPreferences.userAgentString,
+                R.string.action_ok) { s ->
                 userPreferences.userAgentString = s
                 summaryUpdater.updateSummary(it.getString(R.string.agent_custom))
             }
@@ -289,17 +247,17 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
 
 
     private fun showCustomDownloadLocationPicker(summaryUpdater: SummaryUpdater) {
-        activity?.let {
-            val dialogView = LayoutInflater.from(it).inflate(R.layout.dialog_edit_text, null)
+        activity?.let { activity ->
+            val dialogView = LayoutInflater.from(activity).inflate(R.layout.dialog_edit_text, null)
             val getDownload = dialogView.findViewById<EditText>(R.id.dialog_edit_text)
 
-            val errorColor = ContextCompat.getColor(it, R.color.error_red)
-            val regularColor = ThemeUtils.getTextColor(it)
+            val errorColor = ContextCompat.getColor(activity, R.color.error_red)
+            val regularColor = ThemeUtils.getTextColor(activity)
             getDownload.setTextColor(regularColor)
             getDownload.addTextChangedListener(DownloadLocationTextWatcher(getDownload, errorColor, regularColor))
             getDownload.setText(userPreferences.downloadDirectory)
 
-            BrowserDialog.showCustomDialog(it) {
+            BrowserDialog.showCustomDialog(activity) {
                 setTitle(R.string.title_download_location)
                 setView(dialogView)
                 setPositiveButton(R.string.action_ok) { _, _ ->
@@ -313,9 +271,9 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
     }
 
     private class DownloadLocationTextWatcher(
-            private val getDownload: EditText,
-            private val errorColor: Int,
-            private val regularColor: Int
+        private val getDownload: EditText,
+        private val errorColor: Int,
+        private val regularColor: Int
     ) : TextWatcher {
 
         override fun beforeTextChanged(s: CharSequence, start: Int, count: Int, after: Int) {}
@@ -380,10 +338,10 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
 
         activity?.let {
             BrowserDialog.showEditText(it,
-                    R.string.title_custom_homepage,
-                    R.string.title_custom_homepage,
-                    currentHomepage,
-                    R.string.action_ok) { url ->
+                R.string.title_custom_homepage,
+                R.string.title_custom_homepage,
+                currentHomepage,
+                R.string.action_ok) { url ->
                 userPreferences.homepage = url
                 summaryUpdater.updateSummary(url)
             }
@@ -399,13 +357,13 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
     }
 
     private fun convertSearchEngineToString(searchEngines: List<BaseSearchEngine>): Array<CharSequence> =
-            searchEngines.map { getString(it.titleRes) }.toTypedArray()
+        searchEngines.map { getString(it.titleRes) }.toTypedArray()
 
     private fun showSearchProviderDialog(summaryUpdater: SummaryUpdater) {
         BrowserDialog.showCustomDialog(activity) {
             setTitle(resources.getString(R.string.title_search_engine))
 
-            val searchEngineList = searchEngineProvider.getAllSearchEngines()
+            val searchEngineList = searchEngineProvider.provideAllSearchEngines()
 
             val chars = convertSearchEngineToString(searchEngineList)
 
@@ -433,11 +391,11 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
     private fun showCustomSearchDialog(customSearch: CustomSearch, summaryUpdater: SummaryUpdater) {
         activity?.let {
             BrowserDialog.showEditText(
-                    it,
-                    R.string.search_engine_custom,
-                    R.string.search_engine_custom,
-                    userPreferences.searchUrl,
-                    R.string.action_ok
+                it,
+                R.string.search_engine_custom,
+                R.string.search_engine_custom,
+                userPreferences.searchUrl,
+                R.string.action_ok
             ) { searchUrl ->
                 userPreferences.searchUrl = searchUrl
                 summaryUpdater.updateSummary(getSearchEngineSummary(customSearch))
@@ -447,12 +405,13 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
     }
 
     private fun searchSuggestionChoiceToTitle(choice: Suggestions): String =
-            when (choice) {
-                Suggestions.NONE -> getString(R.string.search_suggestions_off)
-                Suggestions.GOOGLE -> getString(R.string.powered_by_google)
-                Suggestions.DUCK -> getString(R.string.powered_by_duck)
-                Suggestions.BAIDU -> getString(R.string.powered_by_baidu)
-            }
+        when (choice) {
+            Suggestions.NONE -> getString(R.string.search_suggestions_off)
+            Suggestions.GOOGLE -> getString(R.string.powered_by_google)
+            Suggestions.DUCK -> getString(R.string.powered_by_duck)
+            Suggestions.BAIDU -> getString(R.string.powered_by_baidu)
+            Suggestions.NAVER -> getString(R.string.powered_by_naver)
+        }
 
     private fun showSearchSuggestionsDialog(summaryUpdater: SummaryUpdater) {
         BrowserDialog.showCustomDialog(activity) {
@@ -462,6 +421,7 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
                 Suggestions.GOOGLE -> 0
                 Suggestions.DUCK -> 1
                 Suggestions.BAIDU -> 2
+                Suggestions.NAVER -> 3
                 Suggestions.NONE -> 3
             }
 
@@ -470,7 +430,8 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
                     0 -> Suggestions.GOOGLE
                     1 -> Suggestions.DUCK
                     2 -> Suggestions.BAIDU
-                    3 -> Suggestions.NONE
+                    3 -> Suggestions.NAVER
+                    4 -> Suggestions.NONE
                     else -> Suggestions.GOOGLE
                 }
                 userPreferences.searchSuggestionChoice = suggestionsProvider.index
@@ -482,9 +443,8 @@ class GeneralSettingsFragment : AbstractSettingsFragment() {
 
     companion object {
         private const val SETTINGS_PROXY = "proxy"
-        private const val SETTINGS_FLASH = "cb_flash"
-        private const val SETTINGS_ADS = "cb_ads"
         private const val SETTINGS_IMAGES = "cb_images"
+        private const val SETTINGS_SAVEDATA = "savedata"
         private const val SETTINGS_JAVASCRIPT = "cb_javascript"
         private const val SETTINGS_COLOR_MODE = "cb_colormode"
         private const val SETTINGS_USER_AGENT = "agent"

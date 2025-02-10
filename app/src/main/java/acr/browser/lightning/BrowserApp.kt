@@ -2,46 +2,65 @@ package acr.browser.lightning
 
 import acr.browser.lightning.database.bookmark.BookmarkExporter
 import acr.browser.lightning.database.bookmark.BookmarkRepository
+import acr.browser.lightning.device.BuildInfo
+import acr.browser.lightning.device.BuildType
 import acr.browser.lightning.di.AppComponent
-import acr.browser.lightning.di.AppModule
 import acr.browser.lightning.di.DaggerAppComponent
+import acr.browser.lightning.di.DatabaseScheduler
+import acr.browser.lightning.di.injector
+import acr.browser.lightning.log.Logger
 import acr.browser.lightning.preference.DeveloperPreferences
 import acr.browser.lightning.utils.FileUtils
 import acr.browser.lightning.utils.MemoryLeakUtils
+import acr.browser.lightning.utils.installMultiDex
 import android.app.Activity
 import android.app.Application
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.os.StrictMode
-import android.support.v7.app.AppCompatDelegate
-import android.util.Log
 import android.webkit.WebView
-import com.anthonycr.bonsai.Schedulers
+import androidx.appcompat.app.AppCompatDelegate
 import com.squareup.leakcanary.LeakCanary
 import io.reactivex.Scheduler
+import io.reactivex.Single
 import io.reactivex.plugins.RxJavaPlugins
 import javax.inject.Inject
-import javax.inject.Named
+import kotlin.system.exitProcess
 
 class BrowserApp : Application() {
 
     @Inject internal lateinit var developerPreferences: DeveloperPreferences
     @Inject internal lateinit var bookmarkModel: BookmarkRepository
-    @Inject @field:Named("database") internal lateinit var databaseScheduler: Scheduler
+    @Inject @field:DatabaseScheduler internal lateinit var databaseScheduler: Scheduler
+    @Inject internal lateinit var logger: Logger
+    @Inject internal lateinit var buildInfo: BuildInfo
+
+    lateinit var applicationComponent: AppComponent
+
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(base)
+        if (BuildConfig.DEBUG && Build.VERSION.SDK_INT < 21) {
+            installMultiDex(context = base)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         if (BuildConfig.DEBUG) {
             StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder()
-                    .detectAll()
-                    .penaltyLog()
-                    .build())
+                .detectAll()
+                .penaltyLog()
+                .build())
             StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder()
-                    .detectAll()
-                    .penaltyLog()
-                    .build())
+                .detectAll()
+                .penaltyLog()
+                .build())
+        }
+
+        if (Build.VERSION.SDK_INT >= 28) {
+            if (getProcessName() == "$packageName:incognito") {
+                WebView.setDataDirectorySuffix("incognito")
+            }
         }
 
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
@@ -54,7 +73,7 @@ class BrowserApp : Application() {
             if (defaultHandler != null) {
                 defaultHandler.uncaughtException(thread, ex)
             } else {
-                System.exit(2)
+                exitProcess(2)
             }
         }
 
@@ -65,57 +84,49 @@ class BrowserApp : Application() {
             }
         }
 
-        appComponent = DaggerAppComponent.builder().appModule(AppModule(this)).build()
-        appComponent.inject(this)
+        applicationComponent = DaggerAppComponent.builder()
+            .application(this)
+            .buildInfo(createBuildInfo())
+            .build()
+        injector.inject(this)
 
-        Schedulers.worker().execute {
-            if (bookmarkModel.count() == 0L) {
-                // If the database is empty, fill it from the assets list
+        Single.fromCallable(bookmarkModel::count)
+            .filter { it == 0L }
+            .flatMapCompletable {
                 val assetsBookmarks = BookmarkExporter.importBookmarksFromAssets(this@BrowserApp)
-                bookmarkModel.addBookmarkList(assetsBookmarks).subscribeOn(databaseScheduler).subscribe()
+                bookmarkModel.addBookmarkList(assetsBookmarks)
             }
-        }
+            .subscribeOn(databaseScheduler)
+            .subscribe()
 
-        if (developerPreferences.useLeakCanary && !isRelease) {
+        if (developerPreferences.useLeakCanary && buildInfo.buildType == BuildType.DEBUG) {
             LeakCanary.install(this)
         }
-        if (!isRelease && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+        if (buildInfo.buildType == BuildType.DEBUG) {
             WebView.setWebContentsDebuggingEnabled(true)
         }
 
         registerActivityLifecycleCallbacks(object : MemoryLeakUtils.LifecycleAdapter() {
             override fun onActivityDestroyed(activity: Activity) {
-                Log.d(TAG, "Cleaning up after the Android framework")
+                logger.log(TAG, "Cleaning up after the Android framework")
                 MemoryLeakUtils.clearNextServedView(activity, this@BrowserApp)
             }
         })
     }
 
-    companion object {
+    /**
+     * Create the [BuildType] from the [BuildConfig].
+     */
+    private fun createBuildInfo() = BuildInfo(when {
+        BuildConfig.DEBUG -> BuildType.DEBUG
+        else -> BuildType.RELEASE
+    })
 
+    companion object {
         private const val TAG = "BrowserApp"
 
         init {
-            AppCompatDelegate.setCompatVectorFromResourcesEnabled(Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT)
-        }
-
-        @JvmStatic
-        lateinit var appComponent: AppComponent
-
-        /**
-         * Determines whether this is a release build.
-         *
-         * @return true if this is a release build, false otherwise.
-         */
-        @JvmStatic
-        val isRelease: Boolean
-            get() = !BuildConfig.DEBUG || BuildConfig.BUILD_TYPE.toLowerCase() == "release"
-
-        @JvmStatic
-        fun copyToClipboard(context: Context, string: String) {
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val clip = ClipData.newPlainText("URL", string)
-            clipboard.primaryClip = clip
+            AppCompatDelegate.setCompatVectorFromResourcesEnabled(Build.VERSION.SDK_INT == Build.VERSION_CODES.KITKAT)
         }
     }
 
